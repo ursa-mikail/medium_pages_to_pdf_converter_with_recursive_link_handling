@@ -1,7 +1,5 @@
 # 📰 Medium Harvester
 
-Caveat: Bot blocking. This version is yet to be worked on. 
-
 > Convert any Medium page — plus all its linked articles — into offline PDFs,
 > cross-linked so clicking a URL in the master PDF opens the matching local PDF.
 
@@ -18,10 +16,6 @@ Caveat: Bot blocking. This version is yet to be worked on.
 | **Live log stream** | Server-Sent Events stream real-time progress to the UI |
 | **Download panel** | All generated PDFs appear as download cards when the job completes |
 
-Note: 
-```
-The copy(document.cookie) command returning undefined is actually a success. In the browser console, the copy() doesn't return a value—it just copies the data to your clipboard.
-```
 ---
 
 ## 🏗️ Architecture

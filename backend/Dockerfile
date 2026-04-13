@@ -3,9 +3,9 @@ FROM golang:1.22-bookworm AS builder
 WORKDIR /app
 COPY go.mod ./
 
-# Use direct GitHub fetching — bypasses proxy.golang.org entirely.
-# GONOSUMDB skips checksum DB verification.
-# GOFLAGS=-mod=mod allows go.sum to be written during build.
+# GOPROXY=direct fetches straight from GitHub, bypassing proxy.golang.org.
+# GONOSUMDB=* skips checksum DB verification (sum.golang.org).
+# GOFLAGS=-mod=mod lets go write go.sum during build.
 ENV GOPROXY=direct \
     GONOSUMDB=* \
     GOFLAGS=-mod=mod \

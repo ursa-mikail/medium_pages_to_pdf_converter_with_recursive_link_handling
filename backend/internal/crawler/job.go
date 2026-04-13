@@ -1,11 +1,13 @@
 package crawler
 
 import (
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -79,7 +81,6 @@ func NewJob(id, rawURL string, cookies []Cookie, outputDir string) *Job {
 	}
 }
 
-// Stop signals the job to cancel as soon as possible.
 func (j *Job) Stop() {
 	j.stopOnce.Do(func() { close(j.stopCh) })
 }
@@ -147,21 +148,39 @@ func (j *Job) Run() {
 		j.fail(err); return
 	}
 
+	// Resolve custom subdomain → canonical medium.com URL upfront.
+	// e.g. mikail-eliyah.medium.com → medium.com/@mikail-eliyah/...
+	// This avoids the stricter Cloudflare rules on custom subdomains entirely.
+	canonicalURL, err := j.resolveCanonicalURL(j.url)
+	if err != nil {
+		j.emit("warn", fmt.Sprintf("Could not resolve canonical URL (%v), using original", err))
+		canonicalURL = j.url
+	} else if canonicalURL != j.url {
+		j.emit("info", fmt.Sprintf("Resolved to canonical: %s", canonicalURL))
+	}
+
+	// Start local proxy — Chrome navigates here, never contacts medium.com directly
+	proxy, err := newLocalProxy(j)
+	if err != nil {
+		j.fail(fmt.Errorf("local proxy: %w", err)); return
+	}
+	defer proxy.close()
+
 	ctx, cancel := j.newCtx()
 	defer cancel()
 
-	// 1. Navigate master page and collect links
-	j.emit("info", "Navigating to master page...")
-	links, err := j.collectLinks(ctx, j.url)
-	if err != nil {
-		j.fail(fmt.Errorf("collect links: %w", err)); return
+	// 1. Collect links
+	j.emit("info", "Fetching master page...")
+	links, linkErr := j.collectLinks(canonicalURL)
+	if linkErr != nil {
+		j.fail(fmt.Errorf("collect links: %w", linkErr)); return
 	}
 	j.emit("info", fmt.Sprintf("Found %d linked Medium articles", len(links)))
 
 	// 2. Master page → PDF
 	mainPDFPath := filepath.Join(j.outputDir, "main", "main.pdf")
 	j.emit("info", "Converting master page to PDF...")
-	if err := j.printToPDF(ctx, j.url, mainPDFPath); err != nil {
+	if err := j.printToPDF(ctx, proxy, canonicalURL, mainPDFPath); err != nil {
 		j.fail(fmt.Errorf("print master PDF: %w", err)); return
 	}
 	j.addFile("main.pdf", "main/main.pdf", j.url)
@@ -170,7 +189,6 @@ func (j *Job) Run() {
 	// 3. Each linked page → PDF
 	pageMap := map[string]string{}
 	for i, link := range links {
-		// Check for stop signal before each page
 		select {
 		case <-j.stopCh:
 			j.emit("warn", "Harvest stopped by user")
@@ -187,17 +205,16 @@ func (j *Job) Run() {
 
 		j.emit("info", fmt.Sprintf("[%d/%d] %s", i+1, len(links), link))
 
-		// human-like delay between requests (also cancellable)
 		select {
 		case <-j.stopCh:
 			j.emit("warn", "Harvest stopped by user")
 			j.setState("stopped")
 			j.closeSubscribers()
 			return
-		case <-time.After(time.Duration(2000+rand.Intn(3000)) * time.Millisecond):
+		case <-time.After(time.Duration(1500+rand.Intn(2000)) * time.Millisecond):
 		}
 
-		if err := j.printToPDF(ctx, link, pdfPath); err != nil {
+		if err := j.printToPDF(ctx, proxy, link, pdfPath); err != nil {
 			j.emit("warn", fmt.Sprintf("Failed: %v", err))
 			continue
 		}
@@ -206,7 +223,6 @@ func (j *Job) Run() {
 		j.emit("ok", fmt.Sprintf("Saved → %s", relPath))
 	}
 
-	// 4. Write link-map sidecar
 	if err := patchPDFLinks(mainPDFPath, pageMap); err != nil {
 		j.emit("warn", fmt.Sprintf("Link sidecar: %v", err))
 	} else {
@@ -236,15 +252,94 @@ func (j *Job) closeSubscribers() {
 	j.mu.Unlock()
 }
 
-// ─── HTTP client (bypasses Cloudflare TLS fingerprinting) ────────────────────
-//
-// Cloudflare's bot detection works at two layers:
-//   1. TLS fingerprinting (JA3/JA4) - identifies headless Chrome at the network level
-//   2. JS challenges - checks browser properties
-//
-// Solution: fetch HTML using Go's net/http (different TLS stack, not flagged) with
-// real browser headers + user cookies, then render locally in chromedp without
-// making any outbound requests. Cloudflare never sees Chrome.
+// ─── Canonical URL resolution ─────────────────────────────────────────────────
+// Custom subdomains (mikail-eliyah.medium.com) have stricter Cloudflare rules.
+// Medium always sets a <link rel="canonical"> pointing to medium.com/@author/...
+// We fetch just the head of the page to extract it, then use that URL instead.
+
+func (j *Job) resolveCanonicalURL(rawURL string) (string, error) {
+	html, err := j.fetchHTML(rawURL)
+	if err != nil {
+		return rawURL, err
+	}
+
+	// Look for <link rel="canonical" href="...">
+	canonRe := regexp.MustCompile(`(?i)<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']`)
+	if m := canonRe.FindStringSubmatch(html); len(m) > 1 {
+		canonical := strings.TrimSpace(m[1])
+		if strings.Contains(canonical, "medium.com") && canonical != rawURL {
+			return canonical, nil
+		}
+	}
+	// Also try href first variant
+	canonRe2 := regexp.MustCompile(`(?i)<link[^>]+href=["']([^"']+)["'][^>]+rel=["']canonical["']`)
+	if m := canonRe2.FindStringSubmatch(html); len(m) > 1 {
+		canonical := strings.TrimSpace(m[1])
+		if strings.Contains(canonical, "medium.com") && canonical != rawURL {
+			return canonical, nil
+		}
+	}
+
+	return rawURL, nil
+}
+
+// ─── Local proxy ──────────────────────────────────────────────────────────────
+// Chrome navigates to http://127.0.0.1:PORT/?src=<url>
+// The proxy fetches via Go's http stack (different TLS fingerprint from Chrome —
+// Cloudflare doesn't flag it) and streams the HTML back.
+// Chrome never contacts medium.com directly.
+
+type localProxy struct {
+	server   *http.Server
+	listener net.Listener
+	job      *Job
+	baseURL  string
+}
+
+func newLocalProxy(j *Job) (*localProxy, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	p := &localProxy{
+		job:     j,
+		baseURL: fmt.Sprintf("http://127.0.0.1:%d", ln.Addr().(*net.TCPAddr).Port),
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", p.handle)
+	p.server = &http.Server{Handler: mux}
+	p.listener = ln
+	go p.server.Serve(ln) //nolint:errcheck
+	return p, nil
+}
+
+func (p *localProxy) close() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	p.server.Shutdown(ctx) //nolint:errcheck
+}
+
+func (p *localProxy) proxyURLFor(mediumURL string) string {
+	return p.baseURL + "/?src=" + url.QueryEscape(mediumURL)
+}
+
+func (p *localProxy) handle(w http.ResponseWriter, r *http.Request) {
+	src := r.URL.Query().Get("src")
+	if src == "" {
+		http.Error(w, "missing src", http.StatusBadRequest)
+		return
+	}
+	html, err := p.job.fetchHTML(src)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	html = makeAbsolute(html, src)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, html)
+}
+
+// ─── HTTP fetch ───────────────────────────────────────────────────────────────
 
 var userAgents = []string{
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -252,12 +347,21 @@ var userAgents = []string{
 	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 }
 
-// buildHTTPClient returns a net/http client that presents as a real browser.
-func (j *Job) buildHTTPClient() *http.Client {
-	return &http.Client{
+// isCloudflarePage detects when we got a CF challenge page instead of real content.
+func isCloudflarePage(html string) bool {
+	return strings.Contains(html, "cf-browser-verification") ||
+		strings.Contains(html, "cf_chl_") ||
+		strings.Contains(html, "Performing security verification") ||
+		strings.Contains(html, "Enable JavaScript and cookies") ||
+		(strings.Contains(html, "cloudflare") && strings.Contains(html, "security"))
+}
+
+func (j *Job) fetchHTML(rawURL string) (string, error) {
+	ua := userAgents[rand.Intn(len(userAgents))]
+	client := &http.Client{
 		Timeout: 30 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// Re-attach cookies on redirects
+			// Re-attach cookies on every redirect hop
 			for _, c := range j.cookies {
 				req.AddCookie(&http.Cookie{Name: c.Name, Value: c.Value})
 			}
@@ -267,25 +371,16 @@ func (j *Job) buildHTTPClient() *http.Client {
 			return nil
 		},
 	}
-}
-
-// fetchHTML fetches a URL using Go's net/http with real browser headers.
-// This bypasses Cloudflare TLS fingerprinting since Go's TLS stack
-// looks nothing like headless Chrome.
-func (j *Job) fetchHTML(rawURL string) (string, error) {
-	ua := userAgents[rand.Intn(len(userAgents))]
-	client := j.buildHTTPClient()
 
 	req, err := http.NewRequest("GET", rawURL, nil)
 	if err != nil {
 		return "", err
 	}
 
-	// Real browser headers — order matters for fingerprinting
 	req.Header.Set("User-Agent", ua)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Accept-Encoding", "gzip")
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("Pragma", "no-cache")
 	req.Header.Set("Sec-Ch-Ua", `"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"`)
@@ -297,7 +392,8 @@ func (j *Job) fetchHTML(rawURL string) (string, error) {
 	req.Header.Set("Sec-Fetch-User", "?1")
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
 
-	// Inject cookies
+	// Attach all user cookies — these are what gets us through the Medium paywall
+	// and, on medium.com (not custom subdomains), past Cloudflare too
 	for _, c := range j.cookies {
 		req.AddCookie(&http.Cookie{Name: c.Name, Value: c.Value})
 	}
@@ -308,25 +404,52 @@ func (j *Job) fetchHTML(rawURL string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 403 {
-		return "", fmt.Errorf("access denied (403) — page may require login cookies")
+	if resp.StatusCode == 403 || resp.StatusCode == 503 {
+		return "", fmt.Errorf("blocked (HTTP %d) by Cloudflare — ensure uid+sid cookies are set", resp.StatusCode)
 	}
 	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("HTTP %d for %s", resp.StatusCode, rawURL)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	var reader io.Reader = resp.Body
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		gz, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return "", fmt.Errorf("gzip: %w", err)
+		}
+		defer gz.Close()
+		reader = gz
+	}
+
+	body, err := io.ReadAll(reader)
 	if err != nil {
 		return "", fmt.Errorf("read body: %w", err)
 	}
-	return string(body), nil
+
+	html := string(body)
+
+	// Detect Cloudflare challenge page served with 200 status
+	if isCloudflarePage(html) {
+		return "", fmt.Errorf("Cloudflare challenge page received — uid+sid cookies required for this page")
+	}
+
+	return html, nil
 }
 
-// ─── Browser context (PDF rendering only — no outbound requests) ─────────────
+// ─── Browser context ──────────────────────────────────────────────────────────
+
+const stealthScript = `
+(function(){
+  Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+  Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});
+  Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});
+  window.chrome={runtime:{},loadTimes:function(){},csi:function(){}};
+})();
+`
 
 func (j *Job) newCtx() (context.Context, context.CancelFunc) {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", "new"), // new headless mode — harder to detect
+		chromedp.Flag("headless", "new"),
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-setuid-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
@@ -334,43 +457,45 @@ func (j *Job) newCtx() (context.Context, context.CancelFunc) {
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
 		chromedp.Flag("window-size", "1920,1080"),
 		chromedp.Flag("lang", "en-US"),
-		chromedp.Flag("run-all-compositor-stages-before-draw", true),
-		chromedp.Flag("disable-background-networking", false),
-		chromedp.Flag("allow-running-insecure-content", true),
+		chromedp.Flag("allow-insecure-localhost", true),
+		chromedp.UserAgent(userAgents[rand.Intn(len(userAgents))]),
 	)
 
 	allocCtx, aCancel := chromedp.NewExecAllocator(context.Background(), opts...)
 	ctx, cCancel := chromedp.NewContext(allocCtx)
 	cancel := func() { cCancel(); aCancel() }
+
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(c context.Context) error {
+		_, err := page.AddScriptToEvaluateOnNewDocument(stealthScript).Do(c)
+		return err
+	})); err != nil {
+		j.emit("warn", fmt.Sprintf("stealth inject: %v", err))
+	}
+
 	return ctx, cancel
 }
 
 // ─── collectLinks ─────────────────────────────────────────────────────────────
-// Fetches via Go http client, parses links from HTML without touching Chrome.
 
-func (j *Job) collectLinks(_ context.Context, rawURL string) ([]string, error) {
+func (j *Job) collectLinks(rawURL string) ([]string, error) {
 	html, err := j.fetchHTML(rawURL)
 	if err != nil {
 		return nil, err
 	}
 
-	// Extract all href values using regex (avoids HTML parser dependency)
 	hrefRe := regexp.MustCompile(`href=["'](https?://[^"'#\s]+)["']`)
 	matches := hrefRe.FindAllStringSubmatch(html, -1)
-
-	j.emit("info", fmt.Sprintf("Raw hrefs collected: %d", len(matches)))
+	j.emit("info", fmt.Sprintf("Raw hrefs found: %d", len(matches)))
 
 	base, _ := url.Parse(rawURL)
 	seen := map[string]bool{stripQuery(rawURL): true}
 	var uniq []string
 	for _, m := range matches {
-		ref := m[1]
-		parsed, err := url.Parse(ref)
+		parsed, err := url.Parse(m[1])
 		if err != nil {
 			continue
 		}
-		resolved := base.ResolveReference(parsed)
-		clean := stripQuery(resolved.String())
+		clean := stripQuery(base.ResolveReference(parsed).String())
 		if !seen[clean] && isMediumArticle(clean) {
 			seen[clean] = true
 			uniq = append(uniq, clean)
@@ -380,48 +505,35 @@ func (j *Job) collectLinks(_ context.Context, rawURL string) ([]string, error) {
 }
 
 // ─── printToPDF ───────────────────────────────────────────────────────────────
-// Fetches HTML via Go http client (bypasses Cloudflare), then renders locally
-// in chromedp by loading content directly — Chrome never makes outbound requests.
+// Go http fetches the HTML (bypassing Cloudflare TLS fingerprinting),
+// local proxy serves it to Chrome, Chrome renders and prints.
+// Chrome never contacts medium.com — Cloudflare never sees it.
 
-func (j *Job) printToPDF(ctx context.Context, rawURL, destPath string) error {
-	// Step 1: fetch HTML with Go's http client — invisible to Cloudflare
-	rawHTML, err := j.fetchHTML(rawURL)
-	if err != nil {
-		return fmt.Errorf("fetch: %w", err)
-	}
+func (j *Job) printToPDF(ctx context.Context, proxy *localProxy, rawURL, destPath string) error {
+	localURL := proxy.proxyURLFor(rawURL)
 
-	// Step 2: rewrite relative URLs to absolute so resources load correctly
-	html := makeAbsolute(rawHTML, rawURL)
-
-	// Step 3: render locally in chromedp, print to PDF
 	var pdfBuf []byte
-	err = chromedp.Run(ctx,
-		// Navigate to the real URL first to set the correct origin context
-		// (needed for same-origin resource loads)
-		chromedp.ActionFunc(func(c context.Context) error {
-			_, _, _, err := page.Navigate(rawURL).Do(c)
-			return err
-		}),
-		chromedp.Sleep(500*time.Millisecond),
-		// Overwrite the page content with our pre-fetched HTML
-		chromedp.ActionFunc(func(c context.Context) error {
-			return page.SetDocumentContent(html).Do(c)
-		}),
+	err := chromedp.Run(ctx,
+		chromedp.Navigate(localURL),
 		chromedp.Sleep(3*time.Second),
-		// Remove paywalls / overlays
+
+		// Remove paywalls / overlays / chrome UI clutter
 		chromedp.Evaluate(`
 			[".overlay",".modal","[data-testid='paywall']",
 			 "[id*='paywall']","[class*='paywall']",
 			 "[class*='overlay']","[class*='banner']",
-			 "[class*='popup']","[class*='cookie']"]
+			 "[class*='popup']","[class*='cookie']",
+			 "[class*='metabar']","[class*='sidebar']",
+			 "nav","footer"]
 			.flatMap(s=>[...document.querySelectorAll(s)])
 			.forEach(el=>el.remove());
 		`, nil),
-		// Scroll to trigger lazy loads
+
 		chromedp.Evaluate(`window.scrollTo(0,document.body.scrollHeight)`, nil),
-		chromedp.Sleep(1500*time.Millisecond),
+		chromedp.Sleep(800*time.Millisecond),
 		chromedp.Evaluate(`window.scrollTo(0,0)`, nil),
-		chromedp.Sleep(500*time.Millisecond),
+		chromedp.Sleep(300*time.Millisecond),
+
 		chromedp.ActionFunc(func(c context.Context) error {
 			var printErr error
 			pdfBuf, _, printErr = page.PrintToPDF().
@@ -443,27 +555,23 @@ func (j *Job) printToPDF(ctx context.Context, rawURL, destPath string) error {
 	return os.WriteFile(destPath, pdfBuf, 0644)
 }
 
-// makeAbsolute rewrites relative src/href attributes to absolute URLs
-// so that resources (images, CSS) load correctly when content is injected locally.
+// makeAbsolute rewrites root-relative src/href/action/srcset to absolute URLs.
 func makeAbsolute(html, baseURL string) string {
 	base, err := url.Parse(baseURL)
 	if err != nil {
 		return html
 	}
-	// Rewrite src="..." and href="..." that start with / or are relative
-	attrRe := regexp.MustCompile(`(src|href|action)=["'](/[^"']*)["']`)
+	attrRe := regexp.MustCompile(`((?:src|href|action|srcset)=["'])(/[^"']*)`)
 	return attrRe.ReplaceAllStringFunc(html, func(match string) string {
 		parts := attrRe.FindStringSubmatch(match)
 		if len(parts) < 3 {
 			return match
 		}
-		attr, path := parts[1], parts[2]
-		ref, err := url.Parse(path)
+		ref, err := url.Parse(parts[2])
 		if err != nil {
 			return match
 		}
-		abs := base.ResolveReference(ref).String()
-		return fmt.Sprintf(`%s="%s"`, attr, abs)
+		return parts[1] + base.ResolveReference(ref).String()
 	})
 }
 
@@ -512,4 +620,3 @@ func sanitizeFilename(rawURL string) string {
 	}
 	return slug
 }
-
