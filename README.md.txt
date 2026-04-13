@@ -22,6 +22,7 @@ Note:
 ```
 The copy(document.cookie) command returning undefined is actually a success. In the browser console, the copy() doesn't return a value—it just copies the data to your clipboard.
 ```
+
 ---
 
 ## 🏗️ Architecture
